@@ -176,4 +176,54 @@ export const api = {
     request<void>(`/tasks/${taskId}/checklist/${itemId}`, token, json("DELETE")),
   subtasks: (token: string, taskId: number) => request<TaskListItem[]>(`/tasks/${taskId}/subtasks`, token),
   addNote: (token: string, taskId: number, body: string) =>
-    request<AuthorEntry>(`/tasks/${taskId}/not
+    request<AuthorEntry>(`/tasks/${taskId}/notes`, token, json("POST", { body })),
+  addComment: (token: string, taskId: number, body: string) =>
+    request<AuthorEntry>(`/tasks/${taskId}/comments`, token, json("POST", { body })),
+  uploadAttachment: (token: string, taskId: number, file: { uri: string; name: string; mimeType: string; file?: File }) => {
+    const formData = new FormData();
+    if (file.file) {
+      // В браузере DocumentPicker отдаёт настоящий File.
+      formData.append("file", file.file, file.name);
+    } else {
+      formData.append("file", { uri: file.uri, name: file.name, type: file.mimeType } as unknown as Blob);
+    }
+    return request<Attachment>(`/tasks/${taskId}/attachments`, token, { method: "POST", body: formData });
+  },
+
+  // --- команда, уведомления, поиск ---
+  team: (token: string) => request<TeamSummary[]>("/team/summary", token),
+  teamTasks: (token: string, userId: number) => request<TaskListItem[]>(`/team/${userId}/tasks`, token),
+  notifications: (token: string) => request<NotificationItem[]>("/notifications", token),
+  markNotificationRead: (token: string, notificationId: number) =>
+    request<NotificationItem>(`/notifications/${notificationId}/read`, token, json("POST")),
+  markAllNotificationsRead: (token: string) => request<void>("/notifications/read-all", token, json("POST")),
+  search: (token: string, query: string) =>
+    request<SearchResponse>(`/search?query=${encodeURIComponent(query)}`, token),
+
+  // --- утренний ритуал ---
+  ritual: (token: string, day?: string) =>
+    request<Ritual>(`/routines${day ? `?day=${encodeURIComponent(day)}` : ""}`, token),
+  createRoutine: (token: string, payload: RoutineInput) => request<Routine>("/routines", token, json("POST", payload)),
+  updateRoutine: (token: string, routineId: number, payload: Partial<RoutineInput>) =>
+    request<Ritual>(`/routines/${routineId}`, token, json("PATCH", payload)),
+  deleteRoutine: (token: string, routineId: number) => request<void>(`/routines/${routineId}`, token, json("DELETE")),
+  checkRoutine: (token: string, routineId: number, day: string) =>
+    request<Ritual>(`/routines/${routineId}/check`, token, json("POST", { day })),
+  uncheckRoutine: (token: string, routineId: number, day: string) =>
+    request<Ritual>(`/routines/${routineId}/check?day=${encodeURIComponent(day)}`, token, json("DELETE")),
+
+  // --- календарь ---
+  calendar: (token: string, from: string, to: string) =>
+    request<CalendarRange>(`/calendar?from=${from}&to=${to}`, token),
+  calculateDate: (token: string, payload: { start_date: string; days: number; mode: DateCalcMode }) =>
+    request<DateCalcResult>("/calendar/calculate", token, json("POST", payload)),
+  createEvent: (token: string, payload: EventInput) =>
+    request<CalendarEvent>("/calendar/events", token, json("POST", payload)),
+  event: (token: string, eventId: number) => request<CalendarEvent>(`/calendar/events/${eventId}`, token),
+  deleteEvent: (token: string, eventId: number) => request<void>(`/calendar/events/${eventId}`, token, json("DELETE")),
+};
+
+export function websocketUrl(ticket: string): string {
+  const base = API_URL.replace(/^http/, "ws");
+  return `${base}/notifications/ws?ticket=${encodeURIComponent(ticket)}`;
+}
