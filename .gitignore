@@ -15,5 +15,7 @@ web-build/
 coverage/
 *.log
 .codex-read/
+.codex-finalizer/
+*.zip
 
 task.md
