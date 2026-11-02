@@ -1,0 +1,19 @@
+{
+  "expo": {
+    "name": "Elite Task",
+    "slug": "elite-task",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "android": {
+      "package": "com.elitelife.taskmanager"
+    },
+    "ios": {
+      "bundleIdentifier": "com.elitelife.taskmanager",
+      "supportsTablet": true
+    },
+    "plugins": [
+      "expo-font"
+    ]
+  }
+}
