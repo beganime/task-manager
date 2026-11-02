@@ -4,13 +4,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.dependencies import get_current_user
-from app.enums import UserRole
-from app.models import Project, ProjectMember, Task, User
-from app.schemas import SearchResponse, UserOut
-from app.services.serializers import TASK_OPTIONS, project_out, task_list_item
-
+from app.models import Project, Task, User
+from app.routers.users import visible_users_statement
+from app.schemas import SearchResponse
+from app.services.access import accessible_projects_clause, task_visibility_clause
+from app.services.serializers import LIST_OPTIONS, projects_out, task_list, user_out
 
 router = APIRouter(prefix="/search", tags=["search"])
+
+
+def like_pattern(query: str) -> str:
+    """Экранирует спецсимволы LIKE: раньше запрос `%%` возвращал всё."""
+    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
 
 
 @router.get("", response_model=SearchResponse)
@@ -19,36 +25,43 @@ async def global_search(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> SearchResponse:
-    pattern = f"%{query.strip()}%"
+    cleaned = query.strip()
+    if len(cleaned) < 2:
+        return SearchResponse(tasks=[], projects=[], users=[])
+    pattern = like_pattern(cleaned)
+
     project_statement = select(Project).where(
         Project.is_archived.is_(False),
-        or_(Project.name.ilike(pattern), Project.description.ilike(pattern)),
+        accessible_projects_clause(user),
+        or_(
+            Project.name.ilike(pattern, escape="\\"),
+            Project.description.ilike(pattern, escape="\\"),
+        ),
     )
     task_statement = (
         select(Task)
         .join(Project, Project.id == Task.project_id)
-        .where(or_(Task.title.ilike(pattern), Task.description.ilike(pattern)))
-        .options(*TASK_OPTIONS)
-    )
-    if user.role == UserRole.MANAGER:
-        accessible_projects = select(ProjectMember.project_id).where(
-            ProjectMember.user_id == user.id
+        .where(
+            task_visibility_clause(user),
+            or_(
+                Task.title.ilike(pattern, escape="\\"),
+                Task.description.ilike(pattern, escape="\\"),
+            ),
         )
-        project_statement = project_statement.where(Project.id.in_(accessible_projects))
-        task_statement = task_statement.where(Task.project_id.in_(accessible_projects))
-
+        .options(*LIST_OPTIONS)
+    )
     projects = list(await session.scalars(project_statement.order_by(Project.name).limit(20)))
     tasks = list(await session.scalars(task_statement.order_by(Task.updated_at.desc()).limit(30)))
     users = list(
         await session.scalars(
-            select(User)
-            .where(User.is_active.is_(True), User.full_name.ilike(pattern))
+            visible_users_statement(user)
+            .where(User.full_name.ilike(pattern, escape="\\"))
             .order_by(User.full_name)
             .limit(20)
         )
     )
     return SearchResponse(
-        tasks=[task_list_item(task) for task in tasks],
-        projects=[await project_out(session, project) for project in projects],
-        users=[UserOut.model_validate(item) for item in users],
+        tasks=await task_list(session, user, tasks),
+        projects=await projects_out(session, projects),
+        users=[user_out(item, user) for item in users],
     )
