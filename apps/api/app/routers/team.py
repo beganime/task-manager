@@ -1,18 +1,19 @@
-from datetime import datetime, timezone
-
-from fastapi import APIRouter, Depends
-from sqlalchemy import case, func, select
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.dependencies import require_roles
 from app.enums import TaskStatus, UserRole
-from app.models import Task, User
+from app.models import Project, Task, User, utcnow
 from app.schemas import TaskListItem, TeamMemberSummary, UserBrief
-from app.services.serializers import TASK_OPTIONS, task_list_item
-
+from app.services.serializers import LIST_OPTIONS, task_list
 
 router = APIRouter(prefix="/team", tags=["team"])
+
+# Статистика команды учитывает только корпоративные проекты: личные проекты
+# сотрудников руководителю не видны.
+CORPORATE_TASKS = select(Project.id).where(Project.is_personal.is_(False))
 
 
 @router.get("/summary", response_model=list[TeamMemberSummary])
@@ -20,7 +21,7 @@ async def team_summary(
     _: User = Depends(require_roles(UserRole.LEADER, UserRole.ADMIN)),
     session: AsyncSession = Depends(get_session),
 ) -> list[TeamMemberSummary]:
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     rows = (
         await session.execute(
             select(
@@ -43,7 +44,13 @@ async def team_summary(
                     "waiting"
                 ),
             )
-            .outerjoin(Task, Task.primary_assignee_id == User.id)
+            .outerjoin(
+                Task,
+                and_(
+                    Task.primary_assignee_id == User.id,
+                    Task.project_id.in_(CORPORATE_TASKS),
+                ),
+            )
             .where(User.role == UserRole.MANAGER, User.is_active.is_(True))
             .group_by(User.id)
             .order_by(User.full_name)
@@ -64,16 +71,18 @@ async def team_summary(
 @router.get("/{user_id}/tasks", response_model=list[TaskListItem])
 async def team_member_tasks(
     user_id: int,
-    _: User = Depends(require_roles(UserRole.LEADER, UserRole.ADMIN)),
+    viewer: User = Depends(require_roles(UserRole.LEADER, UserRole.ADMIN)),
     session: AsyncSession = Depends(get_session),
 ) -> list[TaskListItem]:
+    member = await session.get(User, user_id)
+    if member is None or member.role == UserRole.PERSONAL:
+        raise HTTPException(status_code=404, detail="Сотрудник не найден")
     tasks = list(
         await session.scalars(
             select(Task)
-            .where(Task.primary_assignee_id == user_id)
-            .options(*TASK_OPTIONS)
-            .order_by(Task.due_at.asc())
+            .where(Task.primary_assignee_id == user_id, Task.project_id.in_(CORPORATE_TASKS))
+            .options(*LIST_OPTIONS)
+            .order_by(Task.due_at.is_(None), Task.due_at.asc())
         )
     )
-    return [task_list_item(task) for task in tasks]
-
+    return await task_list(session, viewer, tasks)

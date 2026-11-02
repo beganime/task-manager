@@ -5,6 +5,13 @@ class UserRole(StrEnum):
     LEADER = "leader"
     ADMIN = "admin"
     MANAGER = "manager"
+    # Личный аккаунт: человек вне компании, работает только со своими
+    # личными проектами и проектами, куда его пригласили.
+    PERSONAL = "personal"
+
+
+CORPORATE_ROLES = (UserRole.LEADER, UserRole.ADMIN, UserRole.MANAGER)
+COMPANY_MANAGERS = (UserRole.LEADER, UserRole.ADMIN)
 
 
 class TaskStatus(StrEnum):
@@ -29,4 +36,9 @@ class NotificationKind(StrEnum):
     DEADLINE = "deadline"
     STATUS = "status"
     MENTION = "mention"
+    EVENT = "event"
 
+
+class DateCalcMode(StrEnum):
+    CALENDAR = "calendar"
+    BUSINESS = "business"

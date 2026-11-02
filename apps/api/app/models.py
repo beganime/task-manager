@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 
 from sqlalchemy import (
     JSON,
     Boolean,
-    DateTime,
+    Date,
     Enum,
     ForeignKey,
     Index,
@@ -14,15 +14,17 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
+from app.db_types import UTCDateTime
 from app.enums import NotificationKind, TaskPriority, TaskStatus, UserRole
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class User(Base):
@@ -32,11 +34,24 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     full_name: Mapped[str] = mapped_column(String(160))
     password_hash: Mapped[str] = mapped_column(String(255))
-    role: Mapped[UserRole] = mapped_column(Enum(UserRole, native_enum=False), index=True)
+    role: Mapped[UserRole] = mapped_column(Enum(UserRole, native_enum=False, length=20), index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    # IANA-часовой пояс, определяется автоматически на устройстве пользователя.
+    timezone: Mapped[str] = mapped_column(String(64), default="UTC", server_default="UTC")
+    # Увеличивается при выходе со всех устройств — старые токены перестают работать.
+    token_version: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    reminder_time: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    reminder_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0")
+    )
+    workday_minutes: Mapped[int] = mapped_column(Integer, default=480, server_default=text("480"))
 
     memberships: Mapped[list[ProjectMember]] = relationship(back_populates="user")
+
+    @property
+    def is_personal(self) -> bool:
+        return self.role == UserRole.PERSONAL
 
 
 class Project(Base):
@@ -47,10 +62,13 @@ class Project(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    # Личный проект виден только своим участникам — даже руководитель компании его не видит.
+    is_personal: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), index=True
     )
+    color: Mapped[str] = mapped_column(String(16), default="#F07A2B", server_default="#F07A2B")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
 
     owner: Mapped[User] = relationship(foreign_keys=[owner_id])
     members: Mapped[list[ProjectMember]] = relationship(
@@ -66,7 +84,7 @@ class ProjectMember(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    joined_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     project: Mapped[Project] = relationship(back_populates="members")
     user: Mapped[User] = relationship(back_populates="memberships")
@@ -92,12 +110,16 @@ class Task(Base):
     priority: Mapped[TaskPriority] = mapped_column(
         Enum(TaskPriority, native_enum=False), default=TaskPriority.MEDIUM, index=True
     )
-    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    due_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True, index=True)
     waiting_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    is_favorite: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Устаревшее общее поле. Избранное теперь персональное (TaskFavorite).
+    # Колонка оставлена для совместимости со старыми локальными БД.
+    is_favorite: Mapped[bool] = mapped_column(Boolean, default=False)
+    estimate_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow, index=True
+        UTCDateTime, default=utcnow, onupdate=utcnow, index=True
     )
 
     project: Mapped[Project] = relationship(back_populates="tasks")
@@ -121,6 +143,16 @@ class Task(Base):
     attachments: Mapped[list[Attachment]] = relationship(
         back_populates="task", cascade="all, delete-orphan"
     )
+
+
+class TaskFavorite(Base):
+    __tablename__ = "task_favorites"
+    __table_args__ = (UniqueConstraint("task_id", "user_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
 class TaskCollaborator(Base):
@@ -163,7 +195,7 @@ class TaskNote(Base):
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), index=True)
     author_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     body: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     task: Mapped[Task] = relationship(back_populates="notes")
     author: Mapped[User] = relationship()
@@ -176,7 +208,7 @@ class Comment(Base):
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), index=True)
     author_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     body: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     task: Mapped[Task] = relationship(back_populates="comments")
     author: Mapped[User] = relationship()
@@ -192,7 +224,7 @@ class Attachment(Base):
     storage_name: Mapped[str] = mapped_column(String(255), unique=True)
     content_type: Mapped[str] = mapped_column(String(160), default="application/octet-stream")
     size: Mapped[int] = mapped_column(Integer)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     task: Mapped[Task] = relationship(back_populates="attachments")
 
@@ -205,7 +237,7 @@ class ActivityLog(Base):
     actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     action: Mapped[str] = mapped_column(String(80), index=True)
     details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     task: Mapped[Task] = relationship(back_populates="activities")
     actor: Mapped[User] = relationship()
@@ -222,7 +254,75 @@ class Notification(Base):
     title: Mapped[str] = mapped_column(String(240))
     body: Mapped[str] = mapped_column(Text, default="")
     is_read: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     user: Mapped[User] = relationship()
 
+
+# ---------------------------------------------------------------------------
+# Утренний ритуал
+# ---------------------------------------------------------------------------
+
+
+class Routine(Base):
+    __tablename__ = "routines"
+    __table_args__ = (Index("ix_routines_user_active_position", "user_id", "is_active", "position"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(120))
+    icon: Mapped[str] = mapped_column(String(40), default="sun")
+    color: Mapped[str] = mapped_column(String(16), default="#F07A2B")
+    duration_minutes: Mapped[int] = mapped_column(Integer, default=5)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+    checkins: Mapped[list[RoutineCheckin]] = relationship(
+        back_populates="routine", cascade="all, delete-orphan"
+    )
+
+
+class RoutineCheckin(Base):
+    __tablename__ = "routine_checkins"
+    __table_args__ = (
+        UniqueConstraint("routine_id", "day"),
+        Index("ix_routine_checkins_user_day", "user_id", "day"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    routine_id: Mapped[int] = mapped_column(ForeignKey("routines.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    day: Mapped[date] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+    routine: Mapped[Routine] = relationship(back_populates="checkins")
+
+
+# ---------------------------------------------------------------------------
+# Календарь событий
+# ---------------------------------------------------------------------------
+
+
+class Event(Base):
+    __tablename__ = "events"
+    __table_args__ = (
+        Index("ix_events_owner_start", "owner_id", "starts_at"),
+        Index("ix_events_project_start", "project_id", "starts_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id"), nullable=True)
+    title: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text, default="")
+    starts_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    ends_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    all_day: Mapped[bool] = mapped_column(Boolean, default=True)
+    color: Mapped[str] = mapped_column(String(16), default="#F07A2B")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
+
+    owner: Mapped[User] = relationship(foreign_keys=[owner_id])
+    project: Mapped[Project | None] = relationship()

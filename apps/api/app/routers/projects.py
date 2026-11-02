@@ -1,47 +1,85 @@
-from fastapi import APIRouter, Depends, HTTPException, Response
-from sqlalchemy import delete, select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
-from app.dependencies import get_current_user, require_roles
-from app.enums import UserRole
-from app.models import Project, ProjectMember, Task, User
-from app.schemas import MemberUpdate, ProjectCreate, ProjectOut, ProjectUpdate, TaskListItem, UserOut
-from app.services.access import ensure_project_access, ensure_project_manager
-from app.services.serializers import TASK_OPTIONS, project_out, task_list_item
-
+from app.dependencies import get_current_user
+from app.enums import CORPORATE_ROLES, UserRole
+from app.models import Project, ProjectMember, Task, TaskFavorite, User
+from app.schemas import (
+    MemberUpdate,
+    ProjectCreate,
+    ProjectOut,
+    ProjectUpdate,
+    TaskListItem,
+    UserOut,
+)
+from app.services.access import (
+    accessible_projects_clause,
+    ensure_project_access,
+    ensure_project_manager,
+    is_company_manager,
+    task_visibility_clause,
+)
+from app.services.serializers import LIST_OPTIONS, project_out, projects_out, task_list, user_out
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
 
 @router.get("", response_model=list[ProjectOut])
 async def list_projects(
+    include_archived: bool = False,
+    personal: bool | None = Query(default=None, description="Фильтр: только личные/корпоративные"),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> list[ProjectOut]:
-    statement = select(Project).where(Project.is_archived.is_(False)).order_by(Project.updated_at.desc())
-    if user.role == UserRole.MANAGER:
-        statement = statement.join(ProjectMember).where(ProjectMember.user_id == user.id)
-    projects = list(await session.scalars(statement))
-    return [await project_out(session, project) for project in projects]
+    statement = select(Project).where(accessible_projects_clause(user))
+    if not include_archived:
+        statement = statement.where(Project.is_archived.is_(False))
+    if personal is not None:
+        statement = statement.where(Project.is_personal.is_(personal))
+    projects = list(await session.scalars(statement.order_by(Project.updated_at.desc())))
+    return await projects_out(session, projects)
 
 
 @router.post("", response_model=ProjectOut, status_code=201)
 async def create_project(
     payload: ProjectCreate,
-    user: User = Depends(require_roles(UserRole.LEADER, UserRole.ADMIN)),
+    user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> ProjectOut:
+    # Личный аккаунт создаёт только личные проекты. Любой сотрудник может завести
+    # себе личный проект; корпоративный — только leader/admin.
+    is_personal = payload.is_personal or user.role == UserRole.PERSONAL
+    if not is_personal and not is_company_manager(user):
+        raise HTTPException(status_code=403, detail="Создавать проекты компании может руководитель")
+
     member_ids = set(payload.member_ids)
     member_ids.add(user.id)
-    existing_ids = set(
-        await session.scalars(
-            select(User.id).where(User.id.in_(member_ids), User.is_active.is_(True))
+    if is_personal:
+        # В личный проект участников приглашают по email после создания —
+        # так нельзя «перебрать» id чужих пользователей.
+        member_ids = {user.id}
+    else:
+        existing_ids = set(
+            await session.scalars(
+                select(User.id).where(
+                    User.id.in_(member_ids),
+                    User.is_active.is_(True),
+                    User.role.in_(CORPORATE_ROLES),
+                )
+            )
         )
+        if member_ids != existing_ids:
+            raise HTTPException(status_code=422, detail="Один или несколько участников не найдены")
+
+    project = Project(
+        name=payload.name.strip(),
+        description=payload.description,
+        owner_id=user.id,
+        is_personal=is_personal,
+        color=payload.color or ("#2F7D5B" if not is_personal else "#F07A2B"),
     )
-    if member_ids != existing_ids:
-        raise HTTPException(status_code=422, detail="Один или несколько участников не найдены")
-    project = Project(name=payload.name, description=payload.description, owner_id=user.id)
     session.add(project)
     await session.flush()
     session.add_all(
@@ -70,7 +108,12 @@ async def update_project(
     session: AsyncSession = Depends(get_session),
 ) -> ProjectOut:
     project = await ensure_project_manager(session, user, project_id)
-    for field in payload.model_fields_set:
+    fields = payload.model_fields_set
+    if project.is_archived and fields - {"is_archived"}:
+        raise HTTPException(
+            status_code=409, detail="Проект в архиве. Сначала верните его из архива"
+        )
+    for field in fields:
         setattr(project, field, getattr(payload, field))
     await session.commit()
     await session.refresh(project)
@@ -92,7 +135,7 @@ async def project_members(
             .order_by(User.full_name)
         )
     )
-    return [UserOut.model_validate(member) for member in members]
+    return [user_out(member, user) for member in members]
 
 
 @router.post("/{project_id}/members", response_model=ProjectOut)
@@ -103,17 +146,28 @@ async def add_member(
     session: AsyncSession = Depends(get_session),
 ) -> ProjectOut:
     project = await ensure_project_manager(session, user, project_id)
-    member = await session.get(User, payload.user_id)
+    if project.is_archived:
+        raise HTTPException(status_code=409, detail="Проект в архиве")
+    if payload.email is not None:
+        member = await session.scalar(
+            select(User).where(func.lower(User.email) == payload.email.lower())
+        )
+    else:
+        member = await session.get(User, payload.user_id)
     if not member or not member.is_active:
         raise HTTPException(status_code=422, detail="Пользователь не найден")
+    if not project.is_personal and member.role not in CORPORATE_ROLES:
+        raise HTTPException(
+            status_code=422, detail="В проект компании можно добавить только сотрудника"
+        )
     existing = await session.scalar(
         select(ProjectMember).where(
             ProjectMember.project_id == project_id,
-            ProjectMember.user_id == payload.user_id,
+            ProjectMember.user_id == member.id,
         )
     )
     if not existing:
-        session.add(ProjectMember(project_id=project_id, user_id=payload.user_id))
+        session.add(ProjectMember(project_id=project_id, user_id=member.id))
         await session.commit()
     return await project_out(session, project)
 
@@ -125,7 +179,11 @@ async def remove_member(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> Response:
-    project = await ensure_project_manager(session, user, project_id)
+    if member_id == user.id:
+        # Участник может сам выйти из проекта.
+        project = await ensure_project_access(session, user, project_id)
+    else:
+        project = await ensure_project_manager(session, user, project_id)
     if project.owner_id == member_id:
         raise HTTPException(status_code=422, detail="Нельзя удалить владельца проекта")
     await session.execute(
@@ -145,13 +203,18 @@ async def project_tasks(
     session: AsyncSession = Depends(get_session),
 ) -> list[TaskListItem]:
     await ensure_project_access(session, user, project_id)
+    favorite = (
+        select(TaskFavorite.id)
+        .where(TaskFavorite.task_id == Task.id, TaskFavorite.user_id == user.id)
+        .exists()
+    )
     tasks = list(
         await session.scalars(
             select(Task)
-            .where(Task.project_id == project_id)
-            .options(*TASK_OPTIONS)
-            .order_by(Task.is_favorite.desc(), Task.due_at.asc())
+            .join(Project, Project.id == Task.project_id)
+            .where(Task.project_id == project_id, task_visibility_clause(user))
+            .options(*LIST_OPTIONS)
+            .order_by(favorite.desc(), Task.due_at.is_(None), Task.due_at.asc())
         )
     )
-    return [task_list_item(task) for task in tasks]
-
+    return await task_list(session, user, tasks)

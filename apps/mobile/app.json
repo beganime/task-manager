@@ -3,8 +3,8 @@
     "name": "Elite Task",
     "slug": "elite-task",
     "version": "0.1.0",
-    "orientation": "portrait",
-    "userInterfaceStyle": "light",
+    "orientation": "default",
+    "userInterfaceStyle": "automatic",
     "android": {
       "package": "com.elitelife.taskmanager"
     },
@@ -13,7 +13,24 @@
       "supportsTablet": true
     },
     "plugins": [
-      "expo-font"
-    ]
+      "expo-font",
+      "expo-secure-store",
+      [
+        "expo-notifications",
+        {
+          "color": "#F07A2B"
+        }
+      ]
+    ],
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "name": "Elite Task",
+      "shortName": "Elite Task",
+      "themeColor": "#F07A2B",
+      "backgroundColor": "#FBF2EC",
+      "lang": "ru"
+    },
+    "scheme": "elitetask"
   }
 }

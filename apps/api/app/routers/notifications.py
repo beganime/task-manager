@@ -8,8 +8,7 @@ from app.dependencies import get_current_user
 from app.models import Notification, User
 from app.realtime import manager
 from app.schemas import NotificationOut
-from app.security import decode_access_token
-
+from app.security import decode_token
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
@@ -64,21 +63,29 @@ async def mark_all_read(
 
 
 @router.websocket("/ws")
-async def notifications_websocket(websocket: WebSocket, token: str) -> None:
+async def notifications_websocket(websocket: WebSocket, ticket: str | None = None) -> None:
+    """Подключение по короткоживущему билету из `POST /auth/ws-ticket`.
+
+    Долгоживущий access-токен в query больше не принимается.
+    """
+    if not ticket:
+        await websocket.close(code=4401)
+        return
     try:
-        user_id = decode_access_token(token)
+        payload = decode_token(ticket, expected_type="ws")
     except (jwt.InvalidTokenError, ValueError, KeyError):
         await websocket.close(code=4401)
         return
     async with SessionLocal() as session:
-        user = await session.get(User, user_id)
-        if not user or not user.is_active:
+        user = await session.get(User, payload.user_id)
+        if not user or not user.is_active or user.token_version != payload.token_version:
             await websocket.close(code=4401)
             return
-    await manager.connect(user_id, websocket)
+    await manager.connect(payload.user_id, websocket)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(user_id, websocket)
-
+        pass
+    finally:
+        manager.disconnect(payload.user_id, websocket)
